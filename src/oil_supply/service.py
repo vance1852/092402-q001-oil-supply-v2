@@ -154,21 +154,36 @@ class SupplyService:
         return {"quote_id": quote_id, "price_index": quote.price_index, "trade_date": quote.trade_date}
 
     def price_summary(self, price_index: str, sessions: int = 20) -> dict[str, Any]:
+        if not isinstance(sessions, int) or isinstance(sessions, bool) or sessions <= 0:
+            raise ValidationFailed("sessions 必须是正整数")
+        index = price_index.upper()
         rows = self.connection.execute(
             "SELECT q.trade_date,q.close_usd FROM price_index_quotes q "
             "JOIN (SELECT trade_date,max(quote_id) quote_id FROM price_index_quotes "
             "WHERE price_index=? GROUP BY trade_date) latest ON latest.quote_id=q.quote_id "
             "ORDER BY q.trade_date DESC LIMIT ?",
-            (price_index.upper(), sessions),
+            (index, sessions),
         ).fetchall()
         points = [PricePoint(row["trade_date"], Decimal(row["close_usd"])) for row in rows]
         if not points:
             raise NotFound("没有基准报价")
+        ordered = sorted(points, key=lambda item: item.trade_date)
+        total_sessions = self.connection.execute(
+            "SELECT count(DISTINCT trade_date) AS total FROM price_index_quotes WHERE price_index=?",
+            (index,),
+        ).fetchone()["total"]
         streak = latest_streak(points)
         average = moving_average(points, min(5, len(points)))
-        latest = max(points, key=lambda item: item.trade_date)
+        latest = ordered[-1]
         return {
-            "price_index": price_index.upper(),
+            "price_index": index,
+            "window": {
+                "requested_sessions": sessions,
+                "observations": len(points),
+                "start_date": ordered[0].trade_date,
+                "end_date": latest.trade_date,
+                "truncated": total_sessions > len(points),
+            },
             "latest": {"trade_date": latest.trade_date, "close_usd": decimal_text(latest.close)},
             "latest_streak": None if streak is None else streak.as_dict(),
             "moving_average": None if average is None else decimal_text(average),

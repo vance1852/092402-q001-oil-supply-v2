@@ -48,6 +48,7 @@ class Streak:
     end_date: str
     start_close: Decimal
     end_close: Decimal
+    change_close: Decimal
     percent_change: Decimal
 
     def as_dict(self) -> dict[str, object]:
@@ -58,37 +59,54 @@ class Streak:
             "end_date": self.end_date,
             "start_close": decimal_text(self.start_close),
             "end_close": decimal_text(self.end_close),
-            "percent_change": decimal_text(self.percent_change),
+            "change_close": decimal_text(self.change_close),
+            "change_percent": decimal_text(self.percent_change),
         }
 
 
 def latest_streak(points: Sequence[PricePoint]) -> Streak | None:
-    ordered = sorted(points, key=lambda item: item.trade_date)
+    """最近一段连续同向的日间变动。
+
+    ``sessions`` 表示连续发生的日间变动次数：N 个收盘点之间只有 N-1 个
+    相邻交易日变动，例如七个逐日走低的收盘点构成六连跌（六次下跌变动），
+    累计变化以第一次下跌之前的收盘价为基准点。同一交易日只取最后一个
+    修订版本。只有一个价格点（没有任何日间变动）或最近一个交易日平盘
+    （平盘打断连涨连跌）时返回 None，表示当前无法判定趋势。
+    """
+    latest_by_date: dict[str, PricePoint] = {}
+    for point in points:
+        latest_by_date[point.trade_date] = point
+    ordered = sorted(latest_by_date.values(), key=lambda item: item.trade_date)
     if len(ordered) < 2:
         return None
     last = ordered[-1]
-    previous = ordered[-2]
-    if last.close == previous.close:
-        return Streak("flat", 1, last.trade_date, last.trade_date, last.close, last.close, ZERO)
-    direction = "down" if last.close < previous.close else "up"
-    start_index = len(ordered) - 2
-    while start_index > 0:
-        left = ordered[start_index - 1]
-        right = ordered[start_index]
-        matches = right.close < left.close if direction == "down" else right.close > left.close
-        if not matches:
+    last_move = len(ordered) - 2
+
+    def move_direction(left: PricePoint, right: PricePoint) -> str:
+        if right.close == left.close:
+            return "flat"
+        return "down" if right.close < left.close else "up"
+
+    direction = move_direction(ordered[last_move], ordered[-1])
+    if direction == "flat":
+        return None
+    first_move = last_move
+    while first_move > 0:
+        if move_direction(ordered[first_move - 1], ordered[first_move]) != direction:
             break
-        start_index -= 1
-    start = ordered[start_index]
-    change = (last.close - start.close) / start.close * HUNDRED
+        first_move -= 1
+    start = ordered[first_move]
+    change_close = last.close - start.close
+    percent_change = ZERO if start.close == ZERO else change_close / start.close * HUNDRED
     return Streak(
         direction=direction,
-        sessions=len(ordered) - start_index,
+        sessions=last_move - first_move + 1,
         start_date=start.trade_date,
         end_date=last.trade_date,
         start_close=start.close,
         end_close=last.close,
-        percent_change=change.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+        change_close=change_close,
+        percent_change=percent_change.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
     )
 
 

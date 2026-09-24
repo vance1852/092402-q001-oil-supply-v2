@@ -53,7 +53,7 @@ python3 -m compileall -q src tests
 PYTHONPATH=src python3 -m oil_supply.acceptance --workspace .
 ```
 
-该命令会在内存数据库中登记六个交易日的布伦特报价，创建油田、终端和输送线路，完成库存入账、提名分配、发运及供应情景分析，最后输出一行 JSON。成功时退出码为 `0` 且 `status` 为 `ok`。
+该命令会在内存数据库中登记七个交易日（连续六次日间下跌，即六连跌所需的七个收盘点）的布伦特报价，创建油田、终端和输送线路，完成库存入账、提名分配、发运及供应情景分析，最后输出一行 JSON。成功时退出码为 `0` 且 `status` 为 `ok`。价格摘要中的 `latest_streak.sessions` 表示连续发生的日间变动次数（七个收盘点对应六次下跌），`start_date`/`start_close` 是第一次下跌之前的基准点，`window.truncated` 标识查询窗口是否截断了更早的报价。
 
 现场准入子域也保留独立验收入口：
 
