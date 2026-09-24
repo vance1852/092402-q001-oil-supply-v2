@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
@@ -154,21 +155,38 @@ class SupplyService:
         return {"quote_id": quote_id, "price_index": quote.price_index, "trade_date": quote.trade_date}
 
     def price_summary(self, price_index: str, sessions: int = 20) -> dict[str, Any]:
+        index = price_index.upper()
         rows = self.connection.execute(
             "SELECT q.trade_date,q.close_usd FROM price_index_quotes q "
             "JOIN (SELECT trade_date,max(quote_id) quote_id FROM price_index_quotes "
             "WHERE price_index=? GROUP BY trade_date) latest ON latest.quote_id=q.quote_id "
             "ORDER BY q.trade_date DESC LIMIT ?",
-            (price_index.upper(), sessions),
+            (index, sessions),
         ).fetchall()
         points = [PricePoint(row["trade_date"], Decimal(row["close_usd"])) for row in rows]
         if not points:
             raise NotFound("没有基准报价")
-        streak = latest_streak(points)
+        # 连涨连跌必须基于每个交易日最新修订的完整历史重算，不能受查询窗口
+        # 截断：sessions 只限制观测数与均线窗口。同日修订会改变 max(quote_id)，
+        # 因此这里取到的总是修订后的收盘点。
+        history_rows = self.connection.execute(
+            "SELECT q.trade_date,q.close_usd FROM price_index_quotes q "
+            "JOIN (SELECT trade_date,max(quote_id) quote_id FROM price_index_quotes "
+            "WHERE price_index=? GROUP BY trade_date) latest ON latest.quote_id=q.quote_id "
+            "ORDER BY q.trade_date ASC",
+            (index,),
+        ).fetchall()
+        history = [PricePoint(row["trade_date"], Decimal(row["close_usd"])) for row in history_rows]
+        streak = latest_streak(history)
+        if streak is not None:
+            # 截断指连涨/连跌的基准起点落在查询窗口之外：窗口内的观测数
+            # 不足以完整展示这段趋势（趋势本身仍按完整历史正确计算）。
+            window_dates = {point.trade_date for point in points}
+            streak = replace(streak, truncated=streak.start_date not in window_dates)
         average = moving_average(points, min(5, len(points)))
         latest = max(points, key=lambda item: item.trade_date)
         return {
-            "price_index": price_index.upper(),
+            "price_index": index,
             "latest": {"trade_date": latest.trade_date, "close_usd": decimal_text(latest.close)},
             "latest_streak": None if streak is None else streak.as_dict(),
             "moving_average": None if average is None else decimal_text(average),

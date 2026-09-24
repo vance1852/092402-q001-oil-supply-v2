@@ -48,7 +48,9 @@ class Streak:
     end_date: str
     start_close: Decimal
     end_close: Decimal
+    change: Decimal
     percent_change: Decimal
+    truncated: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -58,37 +60,56 @@ class Streak:
             "end_date": self.end_date,
             "start_close": decimal_text(self.start_close),
             "end_close": decimal_text(self.end_close),
+            "change": decimal_text(self.change),
             "percent_change": decimal_text(self.percent_change),
+            "truncated": self.truncated,
         }
 
 
 def latest_streak(points: Sequence[PricePoint]) -> Streak | None:
-    ordered = sorted(points, key=lambda item: item.trade_date)
+    """返回截至最后一个交易日的连涨/连跌段。
+
+    ``sessions`` 计数的是连续发生的日间变动次数：N 连跌需要 N+1 个收盘点，
+    起点（start_*）是第一次变动之前的基准收盘点，累计变化从该基准点算起。
+    同一交易日出现多个点时，按最新一次取值（模拟同日修订以新版本为准）。
+    不足以判定趋势（少于两个交易日）或最近一个交易日平盘时返回 None；
+    平盘会打断此前的连涨/连跌。若同向变动一直延伸到所给序列的第一个点，
+    ``truncated`` 为 True，表示查询窗口可能截断了更早的历史。
+    """
+    latest_by_date: dict[str, PricePoint] = {}
+    for point in points:
+        latest_by_date[point.trade_date] = point
+    ordered = sorted(latest_by_date.values(), key=lambda item: item.trade_date)
     if len(ordered) < 2:
         return None
     last = ordered[-1]
     previous = ordered[-2]
     if last.close == previous.close:
-        return Streak("flat", 1, last.trade_date, last.trade_date, last.close, last.close, ZERO)
+        return None
     direction = "down" if last.close < previous.close else "up"
-    start_index = len(ordered) - 2
+    start_index = len(ordered) - 1
     while start_index > 0:
         left = ordered[start_index - 1]
         right = ordered[start_index]
-        matches = right.close < left.close if direction == "down" else right.close > left.close
-        if not matches:
+        if direction == "down":
+            if right.close >= left.close:
+                break
+        elif right.close <= left.close:
             break
         start_index -= 1
-    start = ordered[start_index]
-    change = (last.close - start.close) / start.close * HUNDRED
+    base = ordered[start_index]
+    change = last.close - base.close
+    percent_change = change / base.close * HUNDRED
     return Streak(
         direction=direction,
-        sessions=len(ordered) - start_index,
-        start_date=start.trade_date,
+        sessions=len(ordered) - 1 - start_index,
+        start_date=base.trade_date,
         end_date=last.trade_date,
-        start_close=start.close,
+        start_close=base.close,
         end_close=last.close,
-        percent_change=change.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+        change=change,
+        percent_change=percent_change.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+        truncated=start_index == 0,
     )
 
 

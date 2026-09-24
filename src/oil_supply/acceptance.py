@@ -18,7 +18,8 @@ def run(workspace: Path) -> dict[str, object]:
     service = SupplyService(connection, FrozenClock(datetime(2026, 9, 24, 8, 0, tzinfo=timezone.utc)))
     for user_id, role in (("plan", "planner"), ("dispatch", "dispatcher"), ("risk", "risk"), ("audit", "auditor")):
         service.create_user(user_id, user_id, role)
-    for index, close in enumerate(("108", "105", "102", "100", "98", "96"), start=18):
+    # 七个收盘点构成六次相邻交易日下跌（六连跌需要 7 个收盘点）。
+    for index, close in enumerate(("111", "108", "105", "102", "100", "98", "96"), start=17):
         service.record_quote("plan", {"price_index": "BRENT", "trade_date": f"2026-09-{index}", "close_usd": close, "source_revision": f"rev-{index}", "observed_at": f"2026-09-{index}T21:00:00Z"})
     service.create_facility("plan", {"facility_id": "field-a", "name": "北部油田", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_barrels": "500000"})
     service.create_facility("plan", {"facility_id": "terminal-b", "name": "沿海终端", "kind": "terminal", "timezone": "Asia/Shanghai", "capacity_barrels": "800000"})

@@ -5,6 +5,7 @@ import sqlite3
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
+from pathlib import Path
 
 from oil_supply.api import JsonApplication
 from oil_supply.clock import FrozenClock
@@ -14,18 +15,77 @@ from oil_supply.service import SupplyService
 from oil_supply.risk import DemandBucket, inventory_coverage, mark_to_market, supply_gap
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 class PlanningTests(unittest.TestCase):
-    def test_latest_down_streak_uses_first_close_as_base(self) -> None:
-        streak = latest_streak([
-            PricePoint("2026-09-18", Decimal("108")),
-            PricePoint("2026-09-19", Decimal("105")),
-            PricePoint("2026-09-20", Decimal("102")),
-            PricePoint("2026-09-21", Decimal("98")),
-        ])
+    def down_points(self, closes: list[str], start_day: int = 17) -> list[PricePoint]:
+        return [
+            PricePoint(f"2026-09-{start_day + index:02d}", Decimal(close))
+            for index, close in enumerate(closes)
+        ]
+
+    def test_six_day_decline_requires_seven_closes(self) -> None:
+        # 新闻所述六连跌：七个逐日走低的收盘点，只有六次相邻日间变动。
+        streak = latest_streak(self.down_points(["111", "108", "105", "102", "100", "98", "96"]))
         self.assertEqual(streak.direction, "down")
-        self.assertEqual(streak.sessions, 4)
+        self.assertEqual(streak.sessions, 6)
+        self.assertEqual(streak.start_date, "2026-09-17")
+        self.assertEqual(streak.end_date, "2026-09-23")
+        self.assertEqual(streak.start_close, Decimal("111"))
+        self.assertEqual(streak.end_close, Decimal("96"))
+        self.assertEqual(streak.change, Decimal("-15"))
+        self.assertTrue(streak.truncated)
+
+    def test_six_lower_closes_are_only_five_moves(self) -> None:
+        # 缺陷回归：六个走低收盘点只有五次日间变动，不能报成六连跌；
+        # 累计跌幅必须从第一个点（变动前基准价）算起。
+        streak = latest_streak(self.down_points(["108", "105", "102", "100", "98", "96"], start_day=18))
+        self.assertEqual(streak.direction, "down")
+        self.assertEqual(streak.sessions, 5)
         self.assertEqual(streak.start_date, "2026-09-18")
-        self.assertEqual(streak.end_close, Decimal("98"))
+        self.assertEqual(streak.end_date, "2026-09-23")
+        self.assertEqual(streak.start_close, Decimal("108"))
+        self.assertEqual(streak.end_close, Decimal("96"))
+        self.assertEqual(streak.change, Decimal("-12"))
+        self.assertEqual(streak.percent_change, Decimal("-11.1111"))
+
+    def test_single_point_cannot_establish_trend(self) -> None:
+        self.assertIsNone(latest_streak([PricePoint("2026-09-23", Decimal("96"))]))
+        self.assertIsNone(latest_streak([]))
+
+    def test_flat_last_session_breaks_streak(self) -> None:
+        # 末日平盘打断此前的下跌：没有截至最新交易日的连涨/连跌。
+        streak = latest_streak(self.down_points(["108", "105", "102", "102"], start_day=18))
+        self.assertIsNone(streak)
+
+    def test_prior_flat_resets_streak_base(self) -> None:
+        # 中段平盘打断：只统计平盘之后的连续变动，起点为平盘收盘点。
+        streak = latest_streak(self.down_points(["108", "105", "105", "103", "101"], start_day=18))
+        self.assertEqual(streak.direction, "down")
+        self.assertEqual(streak.sessions, 2)
+        self.assertEqual(streak.start_date, "2026-09-20")
+        self.assertEqual(streak.start_close, Decimal("105"))
+        self.assertEqual(streak.change, Decimal("-4"))
+        self.assertFalse(streak.truncated)
+
+    def test_up_streak_counts_moves_and_changes_direction_break(self) -> None:
+        streak = latest_streak(self.down_points(["100", "98", "99", "101", "103"], start_day=18))
+        self.assertEqual(streak.direction, "up")
+        self.assertEqual(streak.sessions, 3)
+        self.assertEqual(streak.start_date, "2026-09-19")
+        self.assertEqual(streak.start_close, Decimal("98"))
+        self.assertEqual(streak.end_close, Decimal("103"))
+        self.assertEqual(streak.change, Decimal("5"))
+
+    def test_same_day_revision_uses_latest_value(self) -> None:
+        # 同一交易日给出多个点时以最后一个为准（模拟同日修订）。
+        points = self.down_points(["108", "105", "102"], start_day=21)
+        points.append(PricePoint("2026-09-23", Decimal("101")))
+        streak = latest_streak(points)
+        self.assertEqual(streak.sessions, 2)
+        self.assertEqual(streak.end_close, Decimal("101"))
+        self.assertEqual(streak.change, Decimal("-7"))
 
     def test_allocation_is_stable_and_does_not_exceed_capacity(self) -> None:
         rows = allocate_capacity(Decimal("100"), [
@@ -84,6 +144,107 @@ class SupplyServiceTests(unittest.TestCase):
         rows = self.connection.execute("SELECT * FROM price_index_quotes ORDER BY quote_id").fetchall()
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[1]["supersedes_quote_id"], rows[0]["quote_id"])
+
+    def record_closes(self, closes: list[tuple[int, str]]) -> None:
+        for day, close in closes:
+            self.quote(day, close)
+
+    def test_price_summary_seven_closes_is_six_day_decline(self) -> None:
+        # 新闻所述六连跌需要七个收盘点。
+        self.record_closes([
+            (17, "111"), (18, "108"), (19, "105"), (20, "102"),
+            (21, "100"), (22, "98"), (23, "96"),
+        ])
+        summary = self.service.price_summary("BRENT")
+        streak = summary["latest_streak"]
+        self.assertEqual(streak["direction"], "down")
+        self.assertEqual(streak["sessions"], 6)
+        self.assertEqual(streak["start_date"], "2026-09-17")
+        self.assertEqual(streak["end_date"], "2026-09-23")
+        self.assertEqual(streak["start_close"], "111")
+        self.assertEqual(streak["end_close"], "96")
+        self.assertEqual(streak["change"], "-15")
+        self.assertEqual(summary["observations"], 7)
+
+    def test_price_summary_six_closes_is_only_five_day_decline(self) -> None:
+        # 缺陷回归：六个收盘点只是五连跌。
+        self.record_closes([(18, "108"), (19, "105"), (20, "102"), (21, "100"), (22, "98"), (23, "96")])
+        streak = self.service.price_summary("BRENT")["latest_streak"]
+        self.assertEqual(streak["sessions"], 5)
+        self.assertEqual(streak["start_date"], "2026-09-18")
+        self.assertEqual(streak["change"], "-12")
+
+    def test_streak_recomputes_after_same_day_revision(self) -> None:
+        self.record_closes([(21, "108"), (22, "105"), (23, "102")])
+        streak = self.service.price_summary("BRENT")["latest_streak"]
+        self.assertEqual(streak["sessions"], 2)
+        self.assertEqual(streak["end_close"], "102")
+        # 修订最后一个交易日的收盘价为平盘：连跌被打断。
+        self.service.record_quote("plan", {"price_index": "BRENT", "trade_date": "2026-09-23", "close_usd": "105", "source_revision": "r-23-corrected", "observed_at": "2026-09-23T22:00:00Z"})
+        self.assertIsNone(self.service.price_summary("BRENT")["latest_streak"])
+        # 修订为更高的收盘价：按修订后价格重算为单日下跌后转涨的结构。
+        self.service.record_quote("plan", {"price_index": "BRENT", "trade_date": "2026-09-23", "close_usd": "106", "source_revision": "r-23-final", "observed_at": "2026-09-23T23:00:00Z"})
+        streak = self.service.price_summary("BRENT")["latest_streak"]
+        self.assertEqual(streak["direction"], "up")
+        self.assertEqual(streak["sessions"], 1)
+        self.assertEqual(streak["start_close"], "105")
+        self.assertEqual(streak["end_close"], "106")
+        self.assertEqual(streak["change"], "1")
+
+    def test_streak_uses_full_history_beyond_query_window(self) -> None:
+        # 窗口只截断观测数与均线，不能截断连跌段。
+        self.record_closes([
+            (14, "120"), (15, "117"), (16, "114"), (17, "111"),
+            (18, "108"), (19, "105"), (20, "102"), (21, "100"),
+            (22, "98"), (23, "96"),
+        ])
+        summary = self.service.price_summary("BRENT", sessions=5)
+        self.assertEqual(summary["observations"], 5)
+        streak = summary["latest_streak"]
+        self.assertEqual(streak["sessions"], 9)
+        self.assertEqual(streak["start_date"], "2026-09-14")
+        self.assertEqual(streak["start_close"], "120")
+        self.assertEqual(streak["end_close"], "96")
+        # 基准起点不在 5 日窗口内，提示摘要窗口未覆盖整段趋势。
+        self.assertTrue(streak["truncated"])
+        # 放大窗口到覆盖完整历史后，同一趋势不再标记为截断。
+        self.assertFalse(self.service.price_summary("BRENT", sessions=20)["latest_streak"]["truncated"])
+
+    def test_window_truncation_is_flagged(self) -> None:
+        # 窗口只保留最近两个收盘点，但连跌的基准起点在窗口之外，标记为截断。
+        self.record_closes([(21, "108"), (22, "105"), (23, "102")])
+        summary = self.service.price_summary("BRENT", sessions=2)
+        self.assertEqual(summary["observations"], 2)
+        streak = summary["latest_streak"]
+        self.assertEqual(streak["sessions"], 2)
+        self.assertEqual(streak["start_date"], "2026-09-21")
+        self.assertTrue(streak["truncated"])
+
+    def test_flat_last_session_has_no_streak(self) -> None:
+        self.record_closes([(21, "108"), (22, "105"), (23, "105")])
+        self.assertIsNone(self.service.price_summary("BRENT")["latest_streak"])
+
+    def test_api_summary_matches_offline_acceptance(self) -> None:
+        from oil_supply import acceptance as offline
+
+        result = offline.run(ROOT)
+        expected = result["price"]["latest_streak"]
+        self.assertEqual(expected["sessions"], 6)
+        self.assertEqual(expected["start_date"], "2026-09-17")
+        self.assertEqual(expected["end_date"], "2026-09-23")
+        self.assertEqual(expected["start_close"], "111")
+        self.assertEqual(expected["end_close"], "96")
+        self.assertEqual(expected["change"], "-15")
+        # 同一报价集通过 HTTP 边界得到完全一致的连涨连跌结论。
+        self.record_closes([
+            (17, "111"), (18, "108"), (19, "105"), (20, "102"),
+            (21, "100"), (22, "98"), (23, "96"),
+        ])
+        response = JsonApplication(self.service).handle(
+            "GET", "/quotes/summary/BRENT", {"X-Actor-Id": "plan"}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.body["latest_streak"], expected)
 
     def test_nomination_replay_and_payload_conflict(self) -> None:
         payload = {"nomination_id": "nom-1", "route_id": "pipe-a-b", "shipper_id": "refinery", "service_date": "2026-09-25", "requested_barrels": "80000", "priority": 10, "idempotency_key": "key-1"}
